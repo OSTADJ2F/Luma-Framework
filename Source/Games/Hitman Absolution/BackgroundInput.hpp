@@ -100,13 +100,16 @@ namespace HMABackgroundInput
    {
       const DWORD result = xinput_state(index, state);
       if (result != ERROR_SUCCESS || !state || index >= 4) return result;
-      if (allow.load(std::memory_order_relaxed)) return result;
       if (Blocked()) memset(&state->Gamepad, 0, sizeof(state->Gamepad));
       return result;
    }
    static void Install()
    {
-      if (patch_count) return;
+      // Try once per process: "patch_count" only counts IAT patches, so without this the DirectInput mid-hooks
+      // would be re-created on every present when no import matched (stacking new hooks on still-live ones).
+      static bool install_attempted = false;
+      if (install_attempted) return;
+      install_attempted = true;
       InstallDirectInput();
       auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
       if (!base) return;
@@ -161,6 +164,10 @@ namespace HMABackgroundInput
          }
       }
       patch_count = 0;
+      // Clear the trampolines' saved originals so their null state matches the restored IAT slots.
+      async_key = nullptr;
+      keyboard_state = nullptr;
+      xinput_state = nullptr;
    }
 }
 #endif

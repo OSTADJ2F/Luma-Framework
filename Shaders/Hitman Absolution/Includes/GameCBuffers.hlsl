@@ -21,7 +21,6 @@ namespace CB
 		float FilmGrainStrength;
 		float SkyHDRBoost;
 		uint SkyDebanding;
-		float SunBrightness;
 		float Exposure;
 		float Contrast;
 		float Saturation;
@@ -40,7 +39,7 @@ namespace CB
 		float ShoulderStart;
 		float HighlightPurity;
 		float EmissiveHDRBoost;
-		float SunShaftHDRBoost;
+		float SunShaftHDRBoost; // WIP: only read by the .disabled SunGlare/SunShaftAdd shaders; keep the slot until they are re-enabled or deleted
 		float VideoAutoHDR;
 		float VanillaHueRestore;
 		uint AutoExposureMode;
@@ -58,6 +57,7 @@ namespace CB
 		uint BokehDOFTapLimit;
 		uint TonemapVersion; // 0 = legacy extended-LUT grade, 1 = neutral-compressed LUT grade upgraded to HDR (UpgradeToneMap)
 		float HazeModel; // 0 = sqrt-space curve blend, 1 = linear HDR experiment
+		uint VideoAutoHDREnable; // 0/1. 1 = Video AutoHDR expansion on the video pass; 0 = flat vanilla-range video.
 	};
 	
 	// Define the game specific cbuffer (instance/pass) data here

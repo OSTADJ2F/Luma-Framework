@@ -39,7 +39,6 @@ struct HMAFlareResources
    ComPtr<ID3D11SamplerState> smp_clamp, smp_border;
    ComPtr<ID3D11BlendState> blend_add;
    ComPtr<ID3D11RasterizerState> raster_nocull;
-   UINT scene_w = 0, scene_h = 0;
 
    void Release()
    {
@@ -57,8 +56,6 @@ struct HMAFlareResources
       smp_border.reset();
       blend_add.reset();
       raster_nocull.reset();
-      scene_w = 0;
-      scene_h = 0;
    }
 };
 
@@ -255,6 +252,8 @@ static bool HMAFlare_EnsureStatics(ID3D11Device* device, HMAFlareResources& res)
 }
 
 // Nulls PS t0..t3 and VS t0. Called before every pass so no SRV is bound while its texture becomes the RT.
+// The VS t0 unbind is not covered by the FullGraphics state stack (it only tracks PS SRVs), so HMA_DrawFlare
+// saves and restores the game's VS t0 around the whole chain.
 static void HMAFlare_UnbindInputs(ID3D11DeviceContext* ctx)
 {
    ID3D11ShaderResourceView* ps_nulls[4] = {};
@@ -329,8 +328,6 @@ static bool HMA_DrawFlare(ID3D11Device* device, ID3D11DeviceContext* ctx, Device
       return false;
    if (settings.glare && !HMAFlare_EnsureTarget(device, res.glare, half_w, half_h))
       return false;
-   res.scene_w = scene_w;
-   res.scene_h = scene_h;
 
    // Constant values per frame (shipped asset defaults, see SPEC_upstream section 4).
    HMAFlareCBData cbd = {};
@@ -375,6 +372,11 @@ static bool HMA_DrawFlare(ID3D11Device* device, ID3D11DeviceContext* ctx, Device
 
    DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
    draw_state_stack.Cache(ctx, device_data.uav_max_count);
+
+   // The FullGraphics stack does not track VS SRVs, and every pass nulls VS t0 ("HMAFlare_UnbindInputs"),
+   // so keep the game's VS t0 ourselves for the restore at the end of the chain.
+   ComPtr<ID3D11ShaderResourceView> prev_game_vs_srv;
+   ctx->VSGetShaderResources(0, 1, prev_game_vs_srv.put());
 
    // Samplers for every pass: s0 = clamp, s1 = border (passes that don't use s0/s1 ignore them).
    ID3D11SamplerState* samplers[2] = { res.smp_clamp.get(), res.smp_border.get() };
@@ -440,9 +442,7 @@ static bool HMA_DrawFlare(ID3D11Device* device, ID3D11DeviceContext* ctx, Device
       const UINT tiles_y = (UINT)cbd.GlareTile[1];
       if (tiles_x > 0 && tiles_y > 0)
       {
-         // Cache the state the stack does not cover: VS t0, VS s1, and the IA vertex buffer.
-         ComPtr<ID3D11ShaderResourceView> prev_vs_srv;
-         ctx->VSGetShaderResources(0, 1, prev_vs_srv.put());
+         // Cache the state the stack does not cover: VS s1 and the IA vertex buffer (VS t0 is saved chain-wide in HMA_DrawFlare).
          ComPtr<ID3D11SamplerState> prev_vs_smp;
          ctx->VSGetSamplers(1, 1, prev_vs_smp.put());
          ComPtr<ID3D11Buffer> prev_vb;
@@ -489,8 +489,6 @@ static bool HMA_DrawFlare(ID3D11Device* device, ID3D11DeviceContext* ctx, Device
          Trace::CustomDraw(ctx, "HMA Flare Glare", 6);
 
          // Restore the uncovered state.
-         ID3D11ShaderResourceView* prev_srv_raw = prev_vs_srv.get();
-         ctx->VSSetShaderResources(0, 1, &prev_srv_raw);
          ID3D11SamplerState* prev_smp_raw = prev_vs_smp.get();
          ctx->VSSetSamplers(1, 1, &prev_smp_raw);
          ID3D11Buffer* prev_vb_raw = prev_vb.get();
@@ -503,6 +501,10 @@ static bool HMA_DrawFlare(ID3D11Device* device, ID3D11DeviceContext* ctx, Device
       settings.glare ? res.glare.srv.get() : nullptr, fade_srv);
 
    draw_state_stack.Restore(ctx);
+
+   // Restore the game's VS t0 that the passes nulled (not tracked by the state stack).
+   ID3D11ShaderResourceView* game_vs_srv = prev_game_vs_srv.get();
+   ctx->VSSetShaderResources(0, 1, &game_vs_srv);
 
    *out_srv = res.final_flare.srv.get();
    return true;
