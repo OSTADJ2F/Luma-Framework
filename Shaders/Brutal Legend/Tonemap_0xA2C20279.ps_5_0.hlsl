@@ -13,7 +13,7 @@ Texture2D<float> t8 : register(t8); // Scene depth (1.0 = far plane / sky), boun
 #define SKY_DEPTH_THRESHOLD 0.99999
 #endif
 #ifndef SKY_BLOOM_SCALE
-#define SKY_BLOOM_SCALE 0.25
+#define SKY_BLOOM_SCALE 1.0 // <1 made fogged mountains (full bloom) glow against the sky
 #endif
 #ifndef SKY_HUE_RESTORE_SCALE
 #define SKY_HUE_RESTORE_SCALE 0.5
@@ -52,6 +52,49 @@ float3 SignPow(float3 x, float e)
   return pow(abs(x), e) * sign(x);
 }
 
+// Vanilla alpha-driven bloom blend, colour matrix and grade offset. x = scene*cb4[116].x + bloom
+float3 GradePre(float3 x, float4 bloomS)
+{
+  float2 bt = bloomS.w + float2(-0.65, -0.92);
+  float2 bw = saturate(float2(6.0, 10.0) * bt + float2(0.65, 0.92));
+  x *= 1.0 - bw.x * 0.4;
+  x *= 1.0 - bw.y;
+
+  float3 e = x * cb4[117].x;
+  float blendW = saturate(dot(cb4[120].xyz, e));
+  float3 m = e.x * cb4[16].xyz + e.y * cb4[17].xyz + e.z * cb4[18].xyz;
+  float3 offs = m + cb4[19].xyz;
+  return blendW * (x * cb4[117].x - offs) + offs; // Pre-clamp colour
+}
+
+#if TONEMAP_TYPE >= 1
+#ifndef BLACK_FLOOR_TOE_RANGE
+#define BLACK_FLOOR_TOE_RANGE 0.15 // gamma-space range the toe acts on
+#endif
+#ifndef BLOOM_OVERFLOW_SCALE
+#define BLOOM_OVERFLOW_SCALE 1.0 // scale of bloom above white, added linearly
+#endif
+// Cubic toe: 0->0, t->t, slope 1 at t, slope a at 0. Monotonic.
+float BlackFloorToe(float x, float strength)
+{
+  float t = BLACK_FLOOR_TOE_RANGE;
+  if (x >= t || strength <= 0.0)
+    return x;
+  float u = max(x, 0.0) / t;
+  float a = 1.0 - saturate(strength);
+  return t * (a * u + 2.0 * (1.0 - a) * u * u + (a - 1.0) * u * u * u);
+}
+
+// Black Floor max-channel toe
+float3 ApplyBlackFloor(float3 c)
+{
+  float cMax = max(max(c.r, c.g), c.b);
+  if (cMax > 0)
+    c *= BlackFloorToe(cMax, LumaSettings.GameSettings.BlackFloor) / cMax;
+  return c;
+}
+#endif
+
 void main(
   float4 v0 : SV_POSITION0,
   float4 v1 : TEXCOORD8,
@@ -84,18 +127,18 @@ void main(
 #endif
   float3 x = sceneS.xyz * cb4[116].x + bloom;
 
-  // Alpha driven blend of the bloom alpha (vanilla)
-  float2 bt = bloomS.w + float2(-0.65, -0.92);
-  float2 bw = saturate(float2(6.0, 10.0) * bt + float2(0.65, 0.92));
-  x *= 1.0 - bw.x * 0.4;
-  x *= 1.0 - bw.y;
+  // Vanilla alpha blend, colour matrix and grade offset (scene + bloom)
+  float3 pre = GradePre(x, bloomS);
 
-  // Vanilla color matrix and grade offset
-  float3 e = x * cb4[117].x;
-  float blendW = saturate(dot(cb4[120].xyz, e));
-  float3 m = e.x * cb4[16].xyz + e.y * cb4[17].xyz + e.z * cb4[18].xyz;
-  float3 offs = m + cb4[19].xyz;
-  float3 pre = blendW * (x * cb4[117].x - offs) + offs; // Pre-clamp colour
+#if TONEMAP_TYPE >= 1
+  pre = ApplyBlackFloor(pre);
+  // Same grade with the scene only (no bloom): bloom is added in linear after the expansion
+  float3 preScene = ApplyBlackFloor(GradePre(sceneS.xyz * cb4[116].x, bloomS));
+  preScene = lerp(preScene, pre, skyMask); // Sky keeps bloom inside its soft shoulder (Sky Brightness cap)
+#if DEVELOPMENT
+  if (LumaSettings.DevSetting01 > 0.5) preScene = pre; // A/B: old gamma-space bloom composite
+#endif
+#endif
 
   // Noise (dither texture)
   float2 nuv = (v5.xy + cb4[121].zw) * cb4[121].xy;
@@ -105,7 +148,7 @@ void main(
 #if TONEMAP_TYPE >= 1
   // SDR chain: vanilla clamp. HDR chain: only the lower clamp.
   float3 sdrG = SignPow(min(max(pre, cb4[122].x), cb4[122].y) * cb4[119].xyz + noise, cb4[123].x);
-  float3 hdrG = SignPow(max(pre, cb4[122].x) * cb4[119].xyz + noise, cb4[123].x);
+  float3 hdrG = SignPow(max(preScene, cb4[122].x) * cb4[119].xyz + noise, cb4[123].x);
 
   float3 sdrLin = gamma_to_linear(sdrG, GCT_MIRROR);
   float hs = LumaSettings.GameSettings.HighlightsStrength;
@@ -115,6 +158,17 @@ void main(
   hiPart = lerp(hiPart, skyHi, skyMask);
   float3 loPart = gamma_to_linear(min(hdrG, 1.0), GCT_MIRROR);
   float3 hdrLin = lerp(hiPart, loPart, step(hdrG, 1.0));
+
+  // Bloom added in linear: the brightening vanilla shows below white, plus bloom above white (linear, not the highlight slope)
+  float3 gFull = max(pre, 0) * cb4[119].xyz;
+  float3 gScene = max(preScene, 0) * cb4[119].xyz;
+  float3 bloomLin = gamma_to_linear(min(gFull, 1.0), GCT_MIRROR) - gamma_to_linear(min(gScene, 1.0), GCT_MIRROR);
+  bloomLin *= 1.0 - skyMask;
+  bloomLin += max(max(gFull, 1.0) - max(gScene, 1.0), 0.0) * BLOOM_OVERFLOW_SCALE;
+#if DEVELOPMENT
+  if (LumaSettings.DevSetting01 <= 0.5)
+#endif
+  hdrLin += max(bloomLin, 0.0);
 
   float s = LumaSettings.GameSettings.VanillaHueRestore;
   float sHue = s * lerp(1.0, SKY_HUE_RESTORE_SCALE, skyMask);

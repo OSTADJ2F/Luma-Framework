@@ -25,7 +25,8 @@ namespace BLXeGTAO
       float tan_half_fov_y = 0.630023f;
       float radius = 0.5f; // view space units (meters)
       float intensity = 1.f; // final visibility exponent, 1 = neutral
-      float padding[2] = {}; // Constant buffers are 16 byte aligned
+      float darkness = 1.f; // linear occlusion strength, 1 = neutral
+      float padding = 0.f; // Constant buffers are 16 byte aligned
    };
    static_assert(sizeof(Constants) == 48);
 
@@ -38,6 +39,7 @@ namespace BLXeGTAO
       float tan_half_fov_y = 0.630023f;
       float radius = 0.5f;
       float intensity = 1.f;
+      float darkness = 1.f;
       uint32_t width = 0;
       uint32_t height = 0;
    };
@@ -189,6 +191,7 @@ namespace BLXeGTAO
       constants.tan_half_fov_y = inputs.tan_half_fov_y;
       constants.radius = inputs.radius;
       constants.intensity = inputs.intensity;
+      constants.darkness = inputs.darkness;
       D3D11_MAPPED_SUBRESOURCE mapped;
       if (FAILED(context->Map(resources.constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
          return false;

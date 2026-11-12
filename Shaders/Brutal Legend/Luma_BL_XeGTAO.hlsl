@@ -21,7 +21,8 @@ cbuffer LumaGTAO : register(b2)
     float TanHalfFovY;
     float EffectRadius;  // view space units (meters)
     float Intensity;     // final visibility exponent, 1 = neutral
-    float2 Padding;      // 16 byte alignment
+    float Darkness;      // linear occlusion strength, 1 = neutral
+    float Padding;       // 16 byte alignment
 }
 
 #if XE_GTAO_QUALITY == 0 // Low
@@ -549,13 +550,20 @@ void denoise_pass_cs(uint2 dtid : SV_DispatchThreadID)
     denoised_ao_term_and_edges[pix_coord_base + uint2(1, 0)] = values[1];
 }
 
-// Final denoise pass: blur beta, writes the final visibility with the exponent applied
+// Applies the exponent (Intensity) and then the linear darkness (Darkness) to a raw occlusion-term visibility
+float XeGTAO_ApplyDarkness(float occlusion_term)
+{
+    float v = pow(saturate(occlusion_term * XE_GTAO_OCCLUSION_TERM_SCALE), max(Intensity, 0.01));
+    return saturate(1.0 - (1.0 - v) * max(Darkness, 0.0));
+}
+
+// Final denoise pass: blur beta, writes the final visibility with the exponent and darkness applied
 [numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)]
 void denoise_final_cs(uint2 dtid : SV_DispatchThreadID)
 {
     const uint2 pix_coord_base = dtid * uint2(2, 1);
     float2 values[2];
     XeGTAO_Denoise(pix_coord_base, tex0, smp, DENOISE_BLUR_BETA, values);
-    final_ao[pix_coord_base + uint2(0, 0)] = pow(saturate(values[0].x * XE_GTAO_OCCLUSION_TERM_SCALE), max(Intensity, 0.01));
-    final_ao[pix_coord_base + uint2(1, 0)] = pow(saturate(values[1].x * XE_GTAO_OCCLUSION_TERM_SCALE), max(Intensity, 0.01));
+    final_ao[pix_coord_base + uint2(0, 0)] = XeGTAO_ApplyDarkness(values[0].x);
+    final_ao[pix_coord_base + uint2(1, 0)] = XeGTAO_ApplyDarkness(values[1].x);
 }

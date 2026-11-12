@@ -25,6 +25,8 @@ namespace CB
 		float VideoDrawActive; // set by c++ per draw, never saved
 		float SkyBrightness; // sky highlight headroom above SDR white, in paper white units (0 = vanilla clip)
 		float SkyDepthActive; // set by c++ per tonemap draw: 1 when the scene depth is bound at t8
+		float BlackFloor; // 0 = vanilla, 1 = strongest toe
+		float XeGTAODarkness; // 1 = neutral, 0 = no AO, 2 = twice as dark
 	};
 	
 	// Define the game specific cbuffer (instance/pass) data here

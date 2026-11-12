@@ -435,9 +435,10 @@ public:
       // Set "device_data.cb_luma_global_settings_dirty" to true if you changed values and need a re-upload to the GPU before OnPresent() (i.e. during OnDrawOrDispatch()).
       default_luma_global_game_settings.HighlightsStrength = cb_luma_global_settings.GameSettings.HighlightsStrength = 1.f;
       default_luma_global_game_settings.VanillaHueRestore = cb_luma_global_settings.GameSettings.VanillaHueRestore = 1.f;
-      default_luma_global_game_settings.BloomIntensity = cb_luma_global_settings.GameSettings.BloomIntensity = 1.f;
+      default_luma_global_game_settings.BloomIntensity = cb_luma_global_settings.GameSettings.BloomIntensity = 0.5f;
       default_luma_global_game_settings.GamutExpansion = cb_luma_global_settings.GameSettings.GamutExpansion = 0.5f;
-      default_luma_global_game_settings.XeGTAOIntensity = cb_luma_global_settings.GameSettings.XeGTAOIntensity = 1.f;
+      default_luma_global_game_settings.XeGTAOIntensity = cb_luma_global_settings.GameSettings.XeGTAOIntensity = 0.75f;
+      default_luma_global_game_settings.XeGTAODarkness = cb_luma_global_settings.GameSettings.XeGTAODarkness = 0.5f;
       default_luma_global_game_settings.XeGTAORadius = cb_luma_global_settings.GameSettings.XeGTAORadius = 1.5f;
       default_luma_global_game_settings.ShadowSoftness = cb_luma_global_settings.GameSettings.ShadowSoftness = 1.5f;
       default_luma_global_game_settings.VideoAutoHDREnable = cb_luma_global_settings.GameSettings.VideoAutoHDREnable = 1.f;
@@ -445,6 +446,7 @@ public:
       cb_luma_global_settings.GameSettings.VideoDrawActive = 0.f; // Set per draw by the sprite draw, never saved
       cb_luma_global_settings.GameSettings.XeGTAOActive = 0.f; // Set per frame by the AO upsample draw, never saved
       default_luma_global_game_settings.SkyBrightness = cb_luma_global_settings.GameSettings.SkyBrightness = 0.6f;
+      default_luma_global_game_settings.BlackFloor = cb_luma_global_settings.GameSettings.BlackFloor = 0.5f;
       cb_luma_global_settings.GameSettings.SkyDepthActive = 0.f; // Set per tonemap draw, never saved
 
       native_shaders_definitions.emplace(CompileTimeStringHash("BL SMAA Decode CS"), ShaderDefinition{ "Luma_SMAA_Decode", reshade::api::pipeline_subobject_type::compute_shader });
@@ -571,6 +573,7 @@ public:
                   gtao_inputs.tan_half_fov_x = game_device_data.gtao_tan_valid ? game_device_data.gtao_tan_x : fallback_tan_y * float(depth_desc.Width) / float(depth_desc.Height);
                   gtao_inputs.radius = cb_luma_global_settings.GameSettings.XeGTAORadius;
                   gtao_inputs.intensity = cb_luma_global_settings.GameSettings.XeGTAOIntensity;
+                  gtao_inputs.darkness = cb_luma_global_settings.GameSettings.XeGTAODarkness;
                   gtao_inputs.width = depth_desc.Width;
                   gtao_inputs.height = depth_desc.Height;
                   if (BLXeGTAO::Draw(native_device, native_device_context, device_data, game_device_data.gtao_resources, gtao_inputs, &gtao_ao_srv) && gtao_ao_srv)
@@ -699,12 +702,14 @@ public:
       reshade::get_config_value(runtime, NAME, "HighlightsStrength", cb_luma_global_settings.GameSettings.HighlightsStrength);
       reshade::get_config_value(runtime, NAME, "VanillaHueRestore", cb_luma_global_settings.GameSettings.VanillaHueRestore);
       reshade::get_config_value(runtime, NAME, "SkyBrightness", cb_luma_global_settings.GameSettings.SkyBrightness);
+      reshade::get_config_value(runtime, NAME, "BlackFloor", cb_luma_global_settings.GameSettings.BlackFloor);
       reshade::get_config_value(runtime, NAME, "BloomIntensity", cb_luma_global_settings.GameSettings.BloomIntensity);
       reshade::get_config_value(runtime, NAME, "GamutExpansion", cb_luma_global_settings.GameSettings.GamutExpansion);
       reshade::get_config_value(runtime, NAME, "SMAAEnable", replace_fxaa_with_smaa);
       reshade::get_config_value(runtime, NAME, "HideCursor", hide_cursor);
       reshade::get_config_value(runtime, NAME, "XeGTAOEnable", replace_ssao_with_xegtao);
       reshade::get_config_value(runtime, NAME, "XeGTAOIntensity", cb_luma_global_settings.GameSettings.XeGTAOIntensity);
+      reshade::get_config_value(runtime, NAME, "XeGTAODarkness", cb_luma_global_settings.GameSettings.XeGTAODarkness);
       reshade::get_config_value(runtime, NAME, "XeGTAORadius", cb_luma_global_settings.GameSettings.XeGTAORadius);
       reshade::get_config_value(runtime, NAME, "ShadowSoftness", cb_luma_global_settings.GameSettings.ShadowSoftness);
       reshade::get_config_value(runtime, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
@@ -740,6 +745,12 @@ public:
          ImGui::SetTooltip("How far the sky can go above SDR white, in paper white units. 0 = vanilla clip.");
       DrawResetButton(cb_luma_global_settings.GameSettings.SkyBrightness, default_luma_global_game_settings.SkyBrightness, "SkyBrightness", runtime);
 
+      if (ImGui::SliderFloat("Black Floor", &cb_luma_global_settings.GameSettings.BlackFloor, 0.f, 1.f, "%.2f"))
+         reshade::set_config_value(runtime, NAME, "BlackFloor", cb_luma_global_settings.GameSettings.BlackFloor);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("Lowers the black level the game's distance fog lifts. 0 is vanilla.");
+      DrawResetButton(cb_luma_global_settings.GameSettings.BlackFloor, default_luma_global_game_settings.BlackFloor, "BlackFloor", runtime);
+
       if (ImGui::SliderFloat("Vanilla Hue Restore", &cb_luma_global_settings.GameSettings.VanillaHueRestore, 0.f, 1.f, "%.3f"))
          reshade::set_config_value(runtime, NAME, "VanillaHueRestore", cb_luma_global_settings.GameSettings.VanillaHueRestore);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -774,6 +785,12 @@ public:
       if (ImGui::SliderFloat("XeGTAO Intensity", &cb_luma_global_settings.GameSettings.XeGTAOIntensity, 0.5f, 3.f, "%.3f"))
          reshade::set_config_value(runtime, NAME, "XeGTAOIntensity", cb_luma_global_settings.GameSettings.XeGTAOIntensity);
       DrawResetButton(cb_luma_global_settings.GameSettings.XeGTAOIntensity, default_luma_global_game_settings.XeGTAOIntensity, "XeGTAOIntensity", runtime);
+
+      if (ImGui::SliderFloat("XeGTAO Darkness", &cb_luma_global_settings.GameSettings.XeGTAODarkness, 0.f, 2.f, "%.2f"))
+         reshade::set_config_value(runtime, NAME, "XeGTAODarkness", cb_luma_global_settings.GameSettings.XeGTAODarkness);
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         ImGui::SetTooltip("How much ambient occlusion darkens. 1 is the default, 0 disables it, 2 is twice as dark.");
+      DrawResetButton(cb_luma_global_settings.GameSettings.XeGTAODarkness, default_luma_global_game_settings.XeGTAODarkness, "XeGTAODarkness", runtime);
 
       if (ImGui::SliderFloat("XeGTAO Radius", &cb_luma_global_settings.GameSettings.XeGTAORadius, 0.1f, 5.f, "%.3f"))
          reshade::set_config_value(runtime, NAME, "XeGTAORadius", cb_luma_global_settings.GameSettings.XeGTAORadius);
