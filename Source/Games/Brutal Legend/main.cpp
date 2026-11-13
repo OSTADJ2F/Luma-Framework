@@ -46,6 +46,8 @@
 // XeGTAO replaces the game's AO generation/blur/upsample (see gtao.h and Shaders/Brutal Legend/Luma_BL_XeGTAO.hlsl).
 #include "gtao.h"
 
+#include "sdl_redirect.h"
+
 #include <atomic>
 #if DEVELOPMENT
 #include <mutex>
@@ -335,6 +337,25 @@ HWND cursor_hook_window = nullptr;
 WNDPROC cursor_prev_wndproc = nullptr;
 std::atomic<bool> cursor_hide_enabled = true;
 
+// True if the game exe has the LARGE_ADDRESS_AWARE flag set (4GB patched). Read from the in-memory PE header, cached once.
+static bool IsGameLargeAddressAware()
+{
+   static const bool large_address_aware = []()
+   {
+      const auto* base = (const uint8_t*)GetModuleHandleW(nullptr);
+      if (!base)
+         return false;
+      const auto* dos = (const IMAGE_DOS_HEADER*)base;
+      if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+         return false;
+      const auto* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+      if (nt->Signature != IMAGE_NT_SIGNATURE)
+         return false;
+      return (nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) != 0;
+   }();
+   return large_address_aware;
+}
+
 static LRESULT CALLBACK CursorWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
    if (msg == WM_SETCURSOR && cursor_hide_enabled && LOWORD(lp) == HTCLIENT)
@@ -371,6 +392,13 @@ public:
    {
       // One-shot: fix the dgVoodoo out-of-bounds GetTexture stage read (self-gated, see function comment).
       TryPatchDgVoodooGetTextureBounds();
+
+      InstallSdlRedirect();
+
+      if (IsGameLargeAddressAware())
+         reshade::log::message(reshade::log::level::info, "[BL] 4GB patch: applied");
+      else
+         reshade::log::message(reshade::log::level::warning, "[BL] 4GB patch: NOT applied, out of memory crashes are likely");
 
       // Snap dgVoodoo's half-pixel shadow atlas viewports before Core's draw-time viewport checks see them.
       reshade::register_event<reshade::addon_event::bind_viewports>(BrutalLegend::OnBindViewports);
@@ -439,7 +467,7 @@ public:
       default_luma_global_game_settings.GamutExpansion = cb_luma_global_settings.GameSettings.GamutExpansion = 0.5f;
       default_luma_global_game_settings.XeGTAOIntensity = cb_luma_global_settings.GameSettings.XeGTAOIntensity = 0.75f;
       default_luma_global_game_settings.XeGTAODarkness = cb_luma_global_settings.GameSettings.XeGTAODarkness = 0.5f;
-      default_luma_global_game_settings.XeGTAORadius = cb_luma_global_settings.GameSettings.XeGTAORadius = 1.5f;
+      default_luma_global_game_settings.XeGTAORadius = cb_luma_global_settings.GameSettings.XeGTAORadius = 10.f; // fixed, no user setting
       default_luma_global_game_settings.ShadowSoftness = cb_luma_global_settings.GameSettings.ShadowSoftness = 1.5f;
       default_luma_global_game_settings.VideoAutoHDREnable = cb_luma_global_settings.GameSettings.VideoAutoHDREnable = 1.f;
       default_luma_global_game_settings.VideoAutoHDR = cb_luma_global_settings.GameSettings.VideoAutoHDR = 0.5f;
@@ -454,6 +482,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("BL XeGTAO Main CS"), ShaderDefinition{ "Luma_BL_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "main_pass_cs" });
       native_shaders_definitions.emplace(CompileTimeStringHash("BL XeGTAO Denoise CS"), ShaderDefinition{ "Luma_BL_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_pass_cs" });
       native_shaders_definitions.emplace(CompileTimeStringHash("BL XeGTAO Denoise Final CS"), ShaderDefinition{ "Luma_BL_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "denoise_final_cs" });
+
    }
 
     // This needs to be overridden with your own "GameDeviceData" sub-class (destruction is automatically handled)
@@ -709,9 +738,7 @@ public:
       reshade::get_config_value(runtime, NAME, "HideCursor", hide_cursor);
       reshade::get_config_value(runtime, NAME, "XeGTAOEnable", replace_ssao_with_xegtao);
       reshade::get_config_value(runtime, NAME, "XeGTAOIntensity", cb_luma_global_settings.GameSettings.XeGTAOIntensity);
-      reshade::get_config_value(runtime, NAME, "XeGTAODarkness", cb_luma_global_settings.GameSettings.XeGTAODarkness);
-      reshade::get_config_value(runtime, NAME, "XeGTAORadius", cb_luma_global_settings.GameSettings.XeGTAORadius);
-      reshade::get_config_value(runtime, NAME, "ShadowSoftness", cb_luma_global_settings.GameSettings.ShadowSoftness);
+      reshade::get_config_value(runtime, NAME, "XeGTAODarkness", cb_luma_global_settings.GameSettings.XeGTAODarkness);      reshade::get_config_value(runtime, NAME, "ShadowSoftness", cb_luma_global_settings.GameSettings.ShadowSoftness);
       reshade::get_config_value(runtime, NAME, "VideoAutoHDREnable", cb_luma_global_settings.GameSettings.VideoAutoHDREnable);
       reshade::get_config_value(runtime, NAME, "VideoAutoHDR", cb_luma_global_settings.GameSettings.VideoAutoHDR);
 
@@ -731,6 +758,18 @@ public:
    void DrawImGuiSettings(DeviceData& device_data) override
    {
       reshade::api::effect_runtime* runtime = nullptr;
+
+      // 4GB (Large Address Aware) patch status.
+      if (IsGameLargeAddressAware())
+      {
+         ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.f), "4GB patch applied");
+      }
+      else
+      {
+         ImGui::TextColored(ImVec4(1.f, 0.75f, 0.2f, 1.f), "Warning: the game is not 4GB patched");
+         ImGui::TextWrapped("BrutalLegend.exe is not Large Address Aware. Apply a 4GB patch to it yourself (e.g. with a 4GB patch tool), otherwise out of memory crashes are likely, especially with HDR and the mod's features enabled.");
+      }
+      ImGui::Separator();
 
       // Draw whatever ImGui to let users modify settings.
       if (ImGui::SliderFloat("Highlights Strength", &cb_luma_global_settings.GameSettings.HighlightsStrength, 0.f, 2.f, "%.3f"))
@@ -791,10 +830,6 @@ public:
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
          ImGui::SetTooltip("How much ambient occlusion darkens. 1 is the default, 0 disables it, 2 is twice as dark.");
       DrawResetButton(cb_luma_global_settings.GameSettings.XeGTAODarkness, default_luma_global_game_settings.XeGTAODarkness, "XeGTAODarkness", runtime);
-
-      if (ImGui::SliderFloat("XeGTAO Radius", &cb_luma_global_settings.GameSettings.XeGTAORadius, 0.1f, 5.f, "%.3f"))
-         reshade::set_config_value(runtime, NAME, "XeGTAORadius", cb_luma_global_settings.GameSettings.XeGTAORadius);
-      DrawResetButton(cb_luma_global_settings.GameSettings.XeGTAORadius, default_luma_global_game_settings.XeGTAORadius, "XeGTAORadius", runtime);
 
       if (ImGui::SliderFloat("Shadow Softness", &cb_luma_global_settings.GameSettings.ShadowSoftness, 0.5f, 2.f, "%.3f"))
          reshade::set_config_value(runtime, NAME, "ShadowSoftness", cb_luma_global_settings.GameSettings.ShadowSoftness);
