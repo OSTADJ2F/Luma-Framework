@@ -2,6 +2,7 @@
 #include "../Includes/DICE.hlsl"
 #include "../Includes/ColorGradingLUT.hlsl"
 #include "Includes/GamutExpansion.hlsl"
+#include "Includes/FilmGrain.hlsl"
 #if TONEMAP_TYPE >= 1
 #include "Includes/PsychoV35.hlsl"
 #include "../Includes/MacLeodBoynton.hlsl"
@@ -12,9 +13,16 @@ Texture2D<float4> t3 : register(t3); // Scene
 Texture2D<float4> t4 : register(t4); // Bloom
 #if TONEMAP_TYPE >= 1
 Texture2D<float> t8 : register(t8); // Scene depth (1.0 = far plane / sky), bound only when SkyDepthActive > 0.5
+Texture2D<float4> t10 : register(t10); // Luma bloom (half res, linear), bound only with LumaBloomEnable
 
 #ifndef SKY_DEPTH_THRESHOLD
 #define SKY_DEPTH_THRESHOLD 0.99999
+#endif
+#ifndef BLOOM_KEEP_FULL_COLOR
+#define BLOOM_KEEP_FULL_COLOR 1 // Bloom Intensity keeps the full-bloom chromaticity (0 = old behaviour, for A/B)
+#endif
+#ifndef FOG_KEEP_FADE_END
+#define FOG_KEEP_FADE_END 0.7 // Fog Keeps Surface Colour fades out linearly to 0 at this fog amount (thick fog keeps the vanilla fog colour; the un-fogged reconstruction is unreliable there)
 #endif
 #ifndef SKY_BLOOM_SCALE
 #define SKY_BLOOM_SCALE 1.0 // <1 made fogged mountains (full bloom) glow against the sky
@@ -149,6 +157,54 @@ float4x4 Fog_Invert4x4(float4x4 m)
   return r * id;
 }
 
+// Reconstructs the game's fog amount f (0 = clear, 1 = fully fogged) at uv from the scene depth. Outputs the clamped view distance and height term.
+float FogReconstruct(float2 uv, float depth, out float dmin, out float h)
+{
+  float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  float4x4 M = float4x4(fogVS[24], fogVS[25], fogVS[26], fogVS[27]);
+  float4x4 invM = Fog_Invert4x4(M);
+  float4 rh = mul(float4(ndc, depth, 1.0), invM);
+  float3 rel = rh.xyz / rh.w;
+
+  dmin = min(length(rel), fogVS[30].y);
+  float f0 = 1.0 - min(exp((fogVS[30].x - dmin) * fogVS[30].w), 1.0);
+  float xh = saturate((fogVS[31].y - (rel.y + fogVS[28].y)) * fogVS[31].z);
+  h = lerp(fogVS[31].w, 1.0, xh);
+  return f0 * h;
+}
+
+// Fog amount at uv for non-sky pixels. valid is false when the fog constants or the scene depth are not bound, or on sky.
+float ComputeFogAmount(float2 uv, out bool valid)
+{
+  valid = false;
+  if (LumaSettings.GameSettings.FogDataActive <= 0.5 || LumaSettings.GameSettings.SkyDepthActive <= 0.5)
+    return 0.0;
+  float depth = t8.SampleLevel(s3_s, uv, 0);
+  if (depth >= SKY_DEPTH_THRESHOLD)
+    return 0.0;
+  valid = true;
+  float dminU, hU;
+  return FogReconstruct(uv, depth, dminU, hU);
+}
+
+// Shrinks the part of a pixel above SDR white in proportion to its fog amount, so fogged highlights don't glow through the fog.
+float3 ApplyFogHighlightLimit(float3 sceneG, float2 uv)
+{
+  if (LumaSettings.GameSettings.FogHighlightLimit <= 0.5)
+    return sceneG;
+  bool valid;
+  float fLim = ComputeFogAmount(uv, valid);
+  if (!valid)
+    return sceneG;
+  float m = max(sceneG.r, max(sceneG.g, sceneG.b));
+  if (m > 1.0)
+  {
+    float m2 = 1.0 + (m - 1.0) * (1.0 - fLim);
+    sceneG *= m2 / m;
+  }
+  return sceneG;
+}
+
 // Re-applies the game's baked fog with the LumaSettings fog overrides. Returns sceneG when no override is set.
 float3 AdjustFog(float3 sceneG, float2 uv, float skyMask)
 {
@@ -163,17 +219,9 @@ float3 AdjustFog(float3 sceneG, float2 uv, float skyMask)
     return sceneG;
 
   float depth = t8.SampleLevel(s3_s, uv, 0);
-  float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-  float4x4 M = float4x4(fogVS[24], fogVS[25], fogVS[26], fogVS[27]);
-  float4x4 invM = Fog_Invert4x4(M);
-  float4 rh = mul(float4(ndc, depth, 1.0), invM);
-  float3 rel = rh.xyz / rh.w;
-
-  float dmin = min(length(rel), fogVS[30].y);
-  float f0 = 1.0 - min(exp((fogVS[30].x - dmin) * fogVS[30].w), 1.0);
-  float xh = saturate((fogVS[31].y - (rel.y + fogVS[28].y)) * fogVS[31].z);
-  float h = lerp(fogVS[31].w, 1.0, xh);
-  float f = f0 * h;
+  float dmin;
+  float h;
+  float f = FogReconstruct(uv, depth, dmin, h);
   if (f >= 0.95)
     return sceneG;
 
@@ -195,13 +243,28 @@ float3 AdjustFog(float3 sceneG, float2 uv, float skyMask)
   if (fogKeepS > 0.0)
   {
     float3 outLin = gamma_to_linear(outG, GCT_MIRROR);
-    float3 litLin = gamma_to_linear(lit, GCT_MIRROR);
-    outLin = RestoreHueAndChrominance(outLin, litLin, 0.0, fogKeepS * f2);
+    float3 litLin = gamma_to_linear(max(lit, 0.0), GCT_MIRROR);
+    // Trust the un-fogged reconstruction only where it stays positive (e.g. foliage drifts negative green -> magenta) and fade it out in thick fog, where 1/(1-f) amplifies errors.
+    float trust = saturate(min(lit.r, min(lit.g, lit.b)) * 20.0 + 1.0) * saturate((FOG_KEEP_FADE_END - f) / FOG_KEEP_FADE_END);
+    // Hue AND chroma from the surface: chroma alone (at the fogged hue) turned red-through-lavender (lava) into saturated magenta.
+    float keepW = fogKeepS * f2 * trust;
+    outLin = RestoreHueAndChrominance(outLin, litLin, keepW, keepW);
     outG = linear_to_gamma(outLin, GCT_MIRROR);
   }
   return outG * k;
 }
 #endif
+
+// Screen flashes tint the image with cb4[119] channels above 1 (e.g. 2.74,0.90,0.83): vanilla's 8 bit output clipped them at white (an orange-red flash).
+// In HDR the x2.7 became highlight energy that the display mapping desaturated to pink/magenta. A tint above 1 may lift a channel up to white, never amplify highlights; tints <= 1 are unchanged.
+float3 FlashTint(float3 x, float3 tint)
+{
+  // Vanilla: pre clipped to 1, tinted, clipped again by the 8 bit output. HDR: bright pixels take the tint's hue (tint / its max channel) at their own
+  // brightness. Capping only the boosted channel left bright fog/sky lavender with red held back -> purple during flash fades. Identity when tint <= 1.
+  float3 vanillaFlash = min(min(x, 1.0) * tint, 1.0);
+  float3 hdrFlash = x * (tint / max(max(tint.r, max(tint.g, tint.b)), 1.0));
+  return max(vanillaFlash, hdrFlash);
+}
 
 void main(
   float4 v0 : SV_POSITION0,
@@ -227,14 +290,22 @@ void main(
 
   // Scene and bloom
   float4 sceneS = ApplyMask(t3.Sample(s3_s, v5.xy), cb3[50], cb3[51]);
+#if TONEMAP_TYPE >= 1
+  // Additive emissives (spider eyes) overflow to FP16 max (65504) in the gamma-space scene; vanilla clipped them. Hue-preserving cap above the brightest real content (sky ~15).
+  sceneS.xyz = ClampByMaxChannel(sceneS.xyz, 16.0);
+#endif
   float4 bloomS = ApplyMask(t4.Sample(s4_s, v6.xy), cb3[52], cb3[53]);
   float3 bloom = bloomS.xyz;
 #if TONEMAP_TYPE >= 1
   bloom *= LumaSettings.GameSettings.BloomIntensity;
   bloom *= lerp(1.0, SKY_BLOOM_SCALE, skyMask);
+  // Luma bloom replaces the game's: zeroing it makes bloomLin below vanish, the Luma term is added in linear instead
+  if (LumaSettings.GameSettings.LumaBloomEnable > 0.5)
+    bloom = 0.0;
 #endif
 #if TONEMAP_TYPE >= 1
   float3 sceneFog = AdjustFog(sceneS.xyz, v5.xy, skyMask);
+  sceneFog = ApplyFogHighlightLimit(sceneFog, v5.xy);
   float3 x = sceneFog * cb4[116].x + bloom;
 #else
   float3 x = sceneS.xyz * cb4[116].x + bloom;
@@ -244,6 +315,18 @@ void main(
   float3 pre = GradePre(x, bloomS);
 
 #if TONEMAP_TYPE >= 1
+  // Bloom Intensity only scales brightness: restore the hue and chroma that full-intensity bloom gives this colour, so fogged terrain does not shift toward pink when the setting is lowered
+  if (BLOOM_KEEP_FULL_COLOR && LumaSettings.GameSettings.BloomIntensity != 1.0 && LumaSettings.GameSettings.LumaBloomEnable <= 0.5)
+  {
+    float3 bloomFull = bloomS.xyz * lerp(1.0, SKY_BLOOM_SCALE, skyMask);
+    float3 preFull = GradePre(sceneFog * cb4[116].x + bloomFull, bloomS);
+    float3 preLin = gamma_to_linear(pre, GCT_MIRROR);
+    float3 preFullLin = gamma_to_linear(preFull, GCT_MIRROR);
+    // Full-bloom chromaticity at the reduced-bloom luminance (copying Oklab chroma oversaturated darker colours and pushed greens negative)
+    const float3 lumW = float3(0.2126, 0.7152, 0.0722);
+    preLin = preFullLin * (max(dot(preLin, lumW), 0.0) / max(dot(preFullLin, lumW), 1e-6));
+    pre = linear_to_gamma(preLin, GCT_MIRROR);
+  }
   pre = ApplyBlackFloor(pre);
   // Same grade with the scene only (no bloom): bloom is added in linear after the expansion
   float3 preScene = ApplyBlackFloor(GradePre(sceneFog * cb4[116].x, bloomS));
@@ -261,9 +344,15 @@ void main(
 #if TONEMAP_TYPE >= 1
   // SDR chain: vanilla clamp. HDR chain: only the lower clamp.
   float3 sdrG = SignPow(min(max(pre, cb4[122].x), cb4[122].y) * cb4[119].xyz + noise, cb4[123].x);
-  float3 hdrG = SignPow(max(preScene, cb4[122].x) * cb4[119].xyz + noise, cb4[123].x);
+  float3 hdrG = SignPow(FlashTint(max(preScene, cb4[122].x), cb4[119].xyz) + noise, cb4[123].x);
 
   float3 sdrLin = gamma_to_linear(sdrG, GCT_MIRROR);
+  // Hue reference from a hue-preserving compressed SDR: per-channel clipping invents hues on over-bright colours
+  float preMax = max(pre.r, max(pre.g, max(pre.b, 1e-6)));
+  float preMaxC = preMax <= 0.8 ? preMax : 0.8 + 0.2 * (preMax - 0.8) / (preMax - 0.8 + 0.2); // identity below 0.8 keeps the vanilla reference for midtones
+  float3 preRef = pre * (preMaxC / preMax);
+  float3 sdrRefG = SignPow(FlashTint(min(max(preRef, cb4[122].x), cb4[122].y), cb4[119].xyz) + noise, cb4[123].x);
+  float3 sdrRefLin = gamma_to_linear(sdrRefG, GCT_MIRROR);
   float hs = LumaSettings.GameSettings.HighlightsStrength;
   float3 hiPart = 1.0 + (hdrG - 1.0) * 2.2 * hs;
   float sb = max(LumaSettings.GameSettings.SkyBrightness, 1e-4);
@@ -273,8 +362,8 @@ void main(
   float3 hdrLin = lerp(hiPart, loPart, step(hdrG, 1.0));
 
   // Bloom added in linear: the brightening vanilla shows below white, plus bloom above white (linear, not the highlight slope)
-  float3 gFull = max(pre, 0) * cb4[119].xyz;
-  float3 gScene = max(preScene, 0) * cb4[119].xyz;
+  float3 gFull = FlashTint(max(pre, 0), cb4[119].xyz);
+  float3 gScene = FlashTint(max(preScene, 0), cb4[119].xyz);
   float3 bloomLin = gamma_to_linear(min(gFull, 1.0), GCT_MIRROR) - gamma_to_linear(min(gScene, 1.0), GCT_MIRROR);
   bloomLin *= 1.0 - skyMask;
   bloomLin += max(max(gFull, 1.0) - max(gScene, 1.0), 0.0) * BLOOM_OVERFLOW_SCALE;
@@ -283,19 +372,25 @@ void main(
 #endif
   hdrLin += max(bloomLin, 0.0);
 
+  // Luma bloom: linear, added where the game's bloom is added (above), so 1.0 = SDR white as for hdrLin
+  float3 lumaBloomLin = 0.0;
+  if (LumaSettings.GameSettings.LumaBloomEnable > 0.5)
+    lumaBloomLin = max(t10.SampleLevel(s3_s, v5.xy, 0).rgb, 0.0) * LumaSettings.GameSettings.LumaBloomIntensity * (1.0 - skyMask);
+  hdrLin += lumaBloomLin;
+
   float s = LumaSettings.GameSettings.VanillaHueRestore;
   float sHue = s * lerp(1.0, SKY_HUE_RESTORE_SCALE, skyMask);
   // PsychoV35 desaturates highlights itself: restore vanilla hue only, not its clipped chroma
   float sChroma = (LumaSettings.DisplayMode == 1 && LumaSettings.GameSettings.Tonemapper >= 0.5) ? 0.0 : sHue;
-  hdrLin = RestoreHueAndChrominance(hdrLin, sdrLin, 0.75 * sHue, sChroma);
+  hdrLin = RestoreHueAndChrominance(hdrLin, sdrRefLin, 0.75 * sHue, sChroma);
 
-  float3 result = max(sdrLin, 0.0);
+  float3 result = max(sdrLin + lumaBloomLin, 0.0); // SDR output gets the Luma bloom too (zero when off)
   if (LumaSettings.DisplayMode == 1)
   {
     // Hue-exact Oklch chroma expansion, bounded by the BT.2020 gamut
     float ge = LumaSettings.GameSettings.GamutExpansion;
     float3 c2020 = ExpandGamutBT709ToBT2020(max(hdrLin, 0.0), ge);
-    c2020 = SimpleGamutClip(GamutCompressBT2020(c2020), true);
+    c2020 = SimpleGamutClip(c2020, true);
 
     const float paperWhite = LumaSettings.GamePaperWhiteNits / sRGB_WhiteLevelNits;
     const float peakWhite = LumaSettings.PeakWhiteNits / sRGB_WhiteLevelNits;
@@ -308,9 +403,12 @@ void main(
       bool smoothFit = LumaSettings.GameSettings.PsychoVGamutFit >= 0.5;
       float3 psy = renodx::tonemap::psychov::psychotm_test35(psyIn, peakRel, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 100.f, 1.f, 1.f, 0, 1.f, 0.18f.xxx, 0.18f.xxx, 1.f, 1, 1.f, LumaSettings.GameSettings.PsychoVShoulder, renodx::tonemap::psychov::PSYCHO35_SOURCE_BOUNDARY_BT709, false, false, smoothFit ? 3 : 2, smoothFit ? 2.f : 0.f);
       if (any(isnan(psy)) || any(isinf(psy))) psy = clamp(psyIn, 0.0, peakRel);
+      float3 psy2020 = BT709_To_BT2020(psy);
       float hueLock = LumaSettings.GameSettings.PsychoVHueLock;
-      if (hueLock > 0.0) psy = BT2020_To_BT709(MacLeodBoynton::HueAndPurityEmulationBT2020(BT709_To_BT2020(psy), c2020, hueLock, 0.0));
-      result = BT2020_To_BT709(SimpleGamutClip(GamutCompressBT2020(BT709_To_BT2020(psy)), true));
+      if (hueLock > 0.0) psy2020 = MacLeodBoynton::HueAndPurityEmulationBT2020(psy2020, c2020, hueLock, 0.0);
+      float psyS = LumaSettings.GameSettings.PsychoVHighlightSaturation;
+      if (psyS > 0.0) psy2020 = lerp(psy2020, MacLeodBoynton::HueAndPurityEmulationBT2020(psy2020, c2020, 0.0, 1.0), psyS);
+      result = BT2020_To_BT709(ClampByMaxChannel(SimpleGamutClip(psy2020, true), peakRel));
     }
     else
 #endif
@@ -319,12 +417,26 @@ void main(
       settings.ShoulderStart = paperWhite / peakWhite;
       result = DICETonemap(BT2020_To_BT709(c2020) * paperWhite, peakWhite, settings) / paperWhite;
       // Final BT.2020 cap
-      result = BT2020_To_BT709(SimpleGamutClip(GamutCompressBT2020(BT709_To_BT2020(result)), true));
+      result = BT2020_To_BT709(ClampByMaxChannel(SimpleGamutClip(BT709_To_BT2020(result), true), peakWhite / paperWhite));
     }
   }
 
+#if TONEMAP_TYPE >= 1
+  // Screen flashes (cb4[119] tint above 1, e.g. 2.74,0.90,0.83) were authored for vanilla's clip: everything bright becomes the tint colour clipped at white.
+  // HDR kept bright fog/sky at their own lavender with red capped -> purple. Fade to the exact vanilla flash by flash strength (tint 1 -> 0%, 2+ -> 100%).
+  float flashW = saturate(max(cb4[119].x, max(cb4[119].y, cb4[119].z)) - 1.0);
+  if (flashW > 0.0)
+  {
+    // With full-intensity bloom, as authored (a lowered Bloom Intensity removes the flash haze and leaves it pink)
+    float3 preFlash = ApplyBlackFloor(GradePre(sceneFog * cb4[116].x + bloomS.xyz * lerp(1.0, SKY_BLOOM_SCALE, skyMask), bloomS));
+    float3 sdrFlashG = SignPow(min(max(preFlash, cb4[122].x), cb4[122].y) * cb4[119].xyz + noise, cb4[123].x);
+    result = lerp(result, gamma_to_linear(saturate(sdrFlashG), GCT_MIRROR), flashW);
+  }
+#endif
+  if (LumaSettings.GameSettings.FilmGrainStrength > 0)
+    result = BL_ApplyFilmGrain(result, v5.xy, frac(LumaSettings.FrameIndex / 1000.0), LumaSettings.GameSettings.FilmGrainStrength * 0.03, 1.0);
   // Inverse of Display Composition's decode (gamma 2.2 in 0-1, sRGB above 1 with GAMMA_CORRECTION_RANGE_TYPE 1), so the peak lands exactly
-  o0.rgb = ColorGradingLUTTransferFunctionInCorrected(result, GAMMA_CORRECTION_TYPE, VANILLA_ENCODING_TYPE);
+  o0.rgb =ColorGradingLUTTransferFunctionInCorrected(result, GAMMA_CORRECTION_TYPE, VANILLA_ENCODING_TYPE);
   o0.a = sqrt(dot(saturate(sdrG), float3(0.3, 0.59, 0.11)));
 #else
   // Exact vanilla

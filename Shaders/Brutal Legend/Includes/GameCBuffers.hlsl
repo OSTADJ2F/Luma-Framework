@@ -37,6 +37,22 @@ namespace CB
 		float FogColorSaturation; // 1 = vanilla fog colour, 0 = grey
 		float FogColorBrightness; // 1 = vanilla
 		float FogKeepColor; // 0 = vanilla, 1 = fogged surfaces keep their own chroma
+		float ShadowPCSS; // 0/1: percentage-closer soft shadows, the blocker search sets the penumbra width
+		float ShadowPCSSLightSize; // scales the PCSS blocker search and penumbra, 1 = default
+		float ShadowPCSSPenumbraScale; // multiplies the PCSS penumbra width per depth gap, 1 = default
+		float ShadowPCSSMaxPenumbra; // PCSS max penumbra in texels per 1024 px of atlas width, 8 = default
+		float ShadowPCSSMinPenumbra; // PCSS min penumbra in texels (contact hardness), 1 = default
+		float ShadowCascadeBlend; // 0/1: blend into the next cascade over the last 10% of each cascade's depth range
+		float ShadowReceiverBias; // 0/1: receiver-plane depth bias per atlas tap
+		float ShadowAtlasMSBound; // 0/1: set by c++ per draw when an MS8 copy of the atlas is bound at t9, taps use Load(sample 0)
+			float LumaBloomEnable; // 0/1: Luma's bloom replaces the game's bloom in the tonemap (0 = game bloom)
+			float LumaBloomIntensity; // 1 = default, linear, added to the scene above SDR white
+			float LumaBloomThreshold; // linear scene brightness where bloom starts, 0 = no threshold
+			float LumaBloomKnee; // soft knee width, fraction of the threshold
+			float LumaBloomRadius; // scales the blur sigmas, 1 = default
+			float FogHighlightLimit; // 0/1: the part of a fogged pixel above SDR white fades with its fog amount (thick fog matches vanilla's clip)
+			float PsychoVHighlightSaturation; // 0-1: restores the colour purity PsychoV removes from very bright highlights (keeps bright reds red instead of pink). 0 = PsychoV default
+				float FilmGrainStrength; // 0-1: RenoDX film grain on the HDR tonemap output. 0 = off
 	};
 	
 	// Define the game specific cbuffer (instance/pass) data here

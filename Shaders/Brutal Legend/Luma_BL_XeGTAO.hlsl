@@ -1,6 +1,8 @@
 // XeGTAO for Brutal Legend (adapted from Luma_DXHR_XeGTAO.hlsl). Reference: https://github.com/GameTechDev/XeGTAO
 // Self-contained: no game cbuffers, only the LumaGTAO constant buffer (b2) set by gtao.h.
 // The input is the game's raw non-linear depth (R32_FLOAT, [0,1]). Linear view depth = DepthLinW / (depth + DepthLinZ).
+// DepthLinZ/W come from the game's cb4 row 16 (b3, read on the GPU). TanHalfFovX/Y come from the GPU copy of cb4 row 17 (b4)
+// when UseGpuFov > 0.5, else from the CPU values (CpuTanHalfFovX/Y). The Cpu* depth fields are unused: kept for layout.
 // View space is right handed (camera looks down -Z), view xy = (uv * (-2 tanX, 2 tanY) + (tanX, -tanY)) * -viewZ.
 // No normals buffer: normals are generated from depth (XE_GTAO_GENERATE_NORMALS).
 // Output: full res R8_UNORM visibility (1 = unoccluded), denoised, with pow(visibility, Intensity).
@@ -15,15 +17,32 @@ cbuffer LumaGTAO : register(b2)
 {
     uint2 ViewportSize;
     float2 ViewportPixelSize;
-    float DepthLinZ;     // linear view depth = DepthLinW / (depth + DepthLinZ)
-    float DepthLinW;
-    float TanHalfFovX;
-    float TanHalfFovY;
+    float CpuDepthLinZ;
+    float CpuDepthLinW;
+    float CpuTanHalfFovX;
+    float CpuTanHalfFovY;
     float EffectRadius;  // view space units (meters)
     float Intensity;     // final visibility exponent, 1 = neutral
     float Darkness;      // linear occlusion strength, 1 = neutral
-    float Padding;       // 16 byte alignment
+    float UseGpuFov;     // 1 = read TanHalfFovX/Y from GameFovRow
 }
+
+// Game PS constant buffer slot 4 (cb4), bound by gtao.h. Row 16 = depth linearization, row 17 = FOV (x, y)
+cbuffer GameCB4 : register(b3)
+{
+    float4 GameCB4Rows[17];
+}
+
+// GPU copy of cb4 row 17 (gtao.h CaptureFov), bound only when valid
+cbuffer GameFov : register(b4)
+{
+    float4 GameFovRow;
+}
+
+#define DepthLinZ GameCB4Rows[16].z
+#define DepthLinW GameCB4Rows[16].w
+#define TanHalfFovX (UseGpuFov > 0.5 ? abs(GameFovRow.x) : CpuTanHalfFovX)
+#define TanHalfFovY (UseGpuFov > 0.5 ? abs(GameFovRow.y) : CpuTanHalfFovY)
 
 #if XE_GTAO_QUALITY == 0 // Low
     #define SLICE_COUNT 4.0

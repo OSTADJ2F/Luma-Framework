@@ -3,6 +3,11 @@
   <ItemGroup>
     <ClCompile Include="main.cpp" />
     <ClInclude Include="sdl_redirect.h" />
+    <ClInclude Include="dgvoodoo_msaa.h" />
+    <ClInclude Include="alpha_test_shaders.h" />
+    <ClInclude Include="dxbc.h" />
+    <ClInclude Include="alpha_to_coverage_patch.h" />
+    <ClInclude Include="spec_highlights_patch.h" />
     <ClCompile Include="..\..\Core\unity_build.cpp" />
   </ItemGroup>
 </Project>

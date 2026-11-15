@@ -47,6 +47,13 @@ float SoftKneeChroma(float s, float sMax, float knee)
   return k + r * x / (x + r);
 }
 
+// Uniformly scales the color down (keeps hue and ratios) so its largest channel does not exceed peak.
+float3 ClampByMaxChannel(float3 x, float peak)
+{
+  float m = max(x.r, max(x.g, x.b));
+  return (m > peak) ? x * (peak / m) : x;
+}
+
 // Expands a linear BT.709 color to linear BT.2020 by scaling its chroma at constant hue and lightness.
 // amount 0 only soft-caps to the BT.2020 gamut.
 float3 ExpandGamutBT709ToBT2020(float3 lin709, float amount)

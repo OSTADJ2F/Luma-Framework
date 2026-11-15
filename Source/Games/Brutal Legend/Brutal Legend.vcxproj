@@ -65,6 +65,9 @@
       <Context>Project</Context>
     </PropertyPageSchema>
   </ItemGroup>
+  <PropertyGroup>
+    <UseLumaSafetyHook>true</UseLumaSafetyHook>
+  </PropertyGroup>
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
   <ImportGroup Label="PropertySheets">
@@ -318,6 +321,11 @@
     <ClCompile Include="..\..\Core\unity_build.cpp" />
     <ClCompile Include="main.cpp" />
     <ClInclude Include="sdl_redirect.h" />
+    <ClInclude Include="dgvoodoo_msaa.h" />
+    <ClInclude Include="alpha_test_shaders.h" />
+    <ClInclude Include="dxbc.h" />
+    <ClInclude Include="alpha_to_coverage_patch.h" />
+    <ClInclude Include="spec_highlights_patch.h" />
   </ItemGroup>
   <!-- Apply feature settings after the final per-configuration properties. -->
   <Import Project="..\Luma.DXP.props" Condition="Exists('..\Luma.DXP.props')" />

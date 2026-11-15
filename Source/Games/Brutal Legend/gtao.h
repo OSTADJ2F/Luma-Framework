@@ -26,16 +26,17 @@ namespace BLXeGTAO
       float radius = 0.5f; // view space units (meters)
       float intensity = 1.f; // final visibility exponent, 1 = neutral
       float darkness = 1.f; // linear occlusion strength, 1 = neutral
-      float padding = 0.f; // Constant buffers are 16 byte aligned
+      float use_gpu_fov = 0.f; // 1 = TanHalfFovX/Y come from the GPU copy of the game's cb4 row 17 (see CaptureFov)
    };
    static_assert(sizeof(Constants) == 48);
 
    struct Inputs
    {
       ID3D11ShaderResourceView* depth_srv = nullptr; // game's raw non-linear depth (R32_FLOAT, single sample)
-      float depth_lin_z = -1.00006f;
+      ID3D11Buffer* game_cb = nullptr; // game's PS constant buffer in slot 4 (row 16 = depth linearization), bound to b3
+      float depth_lin_z = -1.00006f; // CPU fallback, unused by the shader (depth comes from game_cb)
       float depth_lin_w = -0.250015f;
-      float tan_half_fov_x = 1.12004f;
+      float tan_half_fov_x = 1.12004f; // CPU fallback, used when no GPU FOV copy exists yet
       float tan_half_fov_y = 0.630023f;
       float radius = 0.5f;
       float intensity = 1.f;
@@ -68,11 +69,15 @@ namespace BLXeGTAO
       ComPtr<ID3D11UnorderedAccessView> final_uav;
 
       ComPtr<ID3D11Buffer> constant_buffer; // dynamic, Constants
+      ComPtr<ID3D11Buffer> fov_buffer; // default, 16 bytes: game cb4 row 17 copied on the GPU (CaptureFov)
+      bool fov_valid = false;
       UINT width = 0;
       UINT height = 0;
 
       void Release()
       {
+         fov_valid = false;
+         fov_buffer.reset();
          depth_uavs.clear();
          depth_srv.reset();
          depth_texture.reset();
@@ -127,6 +132,8 @@ namespace BLXeGTAO
 
       Resources next;
       next.constant_buffer = resources.constant_buffer;
+      next.fov_buffer = resources.fov_buffer;
+      next.fov_valid = resources.fov_valid;
       // The depth mips get one UAV each (below), the single mip targets get one UAV here
       ComPtr<ID3D11UnorderedAccessView> unused_uav;
       if (!CreateTexture(device, width, height, DXGI_FORMAT_R32_FLOAT, depth_mip_count, next.depth_texture, next.depth_srv, false, unused_uav)
@@ -152,6 +159,36 @@ namespace BLXeGTAO
       return true;
    }
 
+   // Copies game cb4 row 17 (TanHalfFovX/Y in .xy) to a GPU buffer, so the compute shaders read it without a CPU readback.
+   // Call from the shadow resolve draw, where that cbuffer is bound in slot 4.
+   inline void CaptureFov(ID3D11Device* device, ID3D11DeviceContext* context, Resources& resources, ID3D11Buffer* game_cb)
+   {
+      if (!device || !context || !game_cb)
+         return;
+      D3D11_BUFFER_DESC desc = {};
+      game_cb->GetDesc(&desc);
+      if (desc.ByteWidth < 18 * 16)
+         return;
+      if (!resources.fov_buffer)
+      {
+         D3D11_BUFFER_DESC buffer_desc = {};
+         buffer_desc.ByteWidth = 16;
+         buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+         buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+         if (FAILED(device->CreateBuffer(&buffer_desc, nullptr, resources.fov_buffer.put())))
+            return;
+      }
+      D3D11_BOX box = {};
+      box.left = 17 * 16;
+      box.right = 18 * 16;
+      box.top = 0;
+      box.bottom = 1;
+      box.front = 0;
+      box.back = 1;
+      context->CopySubresourceRegion(resources.fov_buffer.get(), 0, 0, 0, 0, game_cb, 0, &box);
+      resources.fov_valid = true;
+   }
+
    // Runs prefilter, main pass and the two denoise passes. On success "out_ao_srv" (if set) receives the R8_UNORM visibility,
    // valid until the next Draw or Release. Returns false before any game state is changed on failure.
    // Binds and restores the compute and graphics state it changes (the render targets are unbound while it runs).
@@ -159,6 +196,12 @@ namespace BLXeGTAO
    {
       if (out_ao_srv) *out_ao_srv = nullptr;
       if (!device || !context || !inputs.depth_srv || inputs.width < min_dimension || inputs.height < min_dimension)
+         return false;
+      if (!inputs.game_cb)
+         return false;
+      D3D11_BUFFER_DESC game_cb_desc = {};
+      inputs.game_cb->GetDesc(&game_cb_desc);
+      if (game_cb_desc.ByteWidth < 17 * 16)
          return false;
 
       auto find_cs = [&](uint32_t name_hash) -> ID3D11ComputeShader*
@@ -192,6 +235,7 @@ namespace BLXeGTAO
       constants.radius = inputs.radius;
       constants.intensity = inputs.intensity;
       constants.darkness = inputs.darkness;
+      constants.use_gpu_fov = resources.fov_valid ? 1.f : 0.f;
       D3D11_MAPPED_SUBRESOURCE mapped;
       if (FAILED(context->Map(resources.constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
          return false;
@@ -204,6 +248,8 @@ namespace BLXeGTAO
       compute_state.Cache(context, device_data.uav_max_count);
 
       ID3D11Buffer* const cb = resources.constant_buffer.get();
+      ID3D11Buffer* const game_cb = inputs.game_cb;
+      ID3D11Buffer* const fov_cb = resources.fov_buffer.get();
       ID3D11SamplerState* sampler = device_data.sampler_state_point.get();
       ID3D11ShaderResourceView* null_srv = nullptr;
       ID3D11UnorderedAccessView* null_uav = nullptr;
@@ -211,6 +257,9 @@ namespace BLXeGTAO
 
       context->OMSetRenderTargets(0, nullptr, nullptr);
       context->CSSetConstantBuffers(2, 1, &cb);
+      context->CSSetConstantBuffers(3, 1, &game_cb);
+      if (resources.fov_valid)
+         context->CSSetConstantBuffers(4, 1, &fov_cb);
       context->CSSetSamplers(0, 1, &sampler);
 
       // 1. Prefilter: raw depth (t0) to the 5 linear depth mips (u0..u4)
